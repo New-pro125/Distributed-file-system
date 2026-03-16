@@ -1,0 +1,86 @@
+syntax = "proto3";
+
+package dfs;
+
+option go_package = "dfs/gen/dfs";
+
+service MasterTracker {
+
+  // Client calls this before uploading a file.
+  // Master responds with the TCP address of a chosen DataKeeper.
+  rpc RequestUpload(UploadRequest) returns (UploadResponse);
+
+  // DataKeeper calls this once the file has been fully received over TCP.
+  // Master adds the record to the lookup table and notifies the client.
+  rpc NotifyUploadDone(NotifyUploadRequest) returns (NotifyUploadResponse);
+
+  // Client calls this to get a list of alive replicas it can download from.
+  rpc RequestDownload(DownloadRequest) returns (DownloadResponse);
+
+  // DataKeeper calls this every 1 second so the Master knows it is alive.
+  // IMPORTANT: must carry host + tcp_port so Master can hand the address
+  // to clients — this is the one field agreed between Dev 1 and Dev 2.
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+}
+
+
+service DataKeeper {
+
+  // Master calls this on both source and destination nodes to trigger
+  // a DK-to-DK TCP file copy.
+  rpc NotifyTransfer(TransferRequest) returns (TransferResponse);
+}
+
+message NodeAddress {
+  string host     = 1; // IPv4 or hostname
+  int32  tcp_port = 2; // port the DataKeeper's TCP server listens on
+}
+
+message UploadRequest {
+  string file_name = 1; // name of the file to be uploaded (e.g. "video.mp4")
+}
+
+message UploadResponse {
+  NodeAddress data_keeper = 1; // address the client should open a TCP conn to
+}
+
+message NotifyUploadRequest {
+  string file_name  = 1; // must match the name sent in UploadRequest
+  string node_id    = 2; // ID of the DataKeeper that received the file
+  string file_path  = 3; // absolute path on the DataKeeper's disk
+}
+
+message NotifyUploadResponse {
+  bool   success = 1;
+  string message = 2; // human-readable status / error detail
+}
+
+message DownloadRequest {
+  string file_name = 1;
+}
+
+message DownloadResponse {
+  repeated NodeAddress nodes = 1; // all alive replicas; client picks uniformly
+}
+
+message HeartbeatRequest {
+  string      node_id  = 1; // unique ID of this DataKeeper
+  NodeAddress address  = 2; // host + tcp_port — Dev 1 needs this to hand
+                             // the address to clients & the replication loop
+}
+
+message HeartbeatResponse {
+  bool accepted = 1; // false means the Master does not recognise this node
+}
+
+message TransferRequest {
+  NodeAddress src       = 1; // DataKeeper that currently holds the file
+  NodeAddress dst       = 2; // DataKeeper that should receive the copy
+  string      file_name = 3;
+  string      file_path = 4; // path on the source node's disk
+}
+
+message TransferResponse {
+  bool   success = 1;
+  string message = 2;
+}
