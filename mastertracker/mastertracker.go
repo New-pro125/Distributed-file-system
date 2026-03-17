@@ -178,6 +178,7 @@ func (m *MasterTracker) Heartbeat(ctx context.Context, req *pb.HeartbeatRequest)
 
 	info.Host = addr.GetHost()
 	info.TcpPort = addr.GetTcpPort()
+	info.GrpcPort = addr.GetGrpcPort()
 	info.LastSeen = time.Now()
 	info.IsAlive = true
 
@@ -285,16 +286,12 @@ func (m *MasterTracker) selectMachineToCopyTo(fileName string, records []FileRec
 
 func (m *MasterTracker) notifyMachineDataTransfer(src *NodeInfo, dst *NodeInfo, fileName, filePath string) {
 
-	dstGrpcAddr := fmt.Sprintf("%s:%d", dst.Host, dst.TcpPort+1)
-	if dst.GrpcPort != 0 {
-		dstGrpcAddr = fmt.Sprintf("%s:%d", dst.Host, dst.GrpcPort)
-	}
-
-	conn, err := grpc.NewClient(dstGrpcAddr,
+	srcGrpcAddr := fmt.Sprintf("%s:%d", src.Host, src.GrpcPort)
+	conn, err := grpc.NewClient(srcGrpcAddr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		log.Printf("[MasterTracker] Failed to dial DataKeeper %s at %s: %v",
-			dst.NodeID, dstGrpcAddr, err)
+		log.Printf("[MasterTracker] Failed to dial source DataKeeper %s at %s: %v",
+			src.NodeID, srcGrpcAddr, err)
 		return
 	}
 	defer conn.Close()

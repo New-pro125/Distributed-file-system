@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package dfs;
 
-option go_package = "dfs/gen/dfs";
+option go_package = "github.com/New-pro125/distributed-file-system/gen/proto";
 
 service MasterTracker {
 
@@ -32,8 +32,9 @@ service DataKeeper {
 }
 
 message NodeAddress {
-  string host     = 1; // IPv4 or hostname
-  int32  tcp_port = 2; // port the DataKeeper's TCP server listens on
+  string host      = 1; // IPv4 or hostname
+  int32  tcp_port  = 2; // port the DataKeeper's TCP server listens on
+  int32  grpc_port = 3; // port the DataKeeper's gRPC server listens on
 }
 
 message UploadRequest {
