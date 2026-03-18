@@ -66,6 +66,9 @@ func New(id, host string, grpcPort, tcpPort int32, storageDir, masterAddr string
 
 // Start begins the DataKeeper services
 func (dk *DataKeeper) Start() error {
+	// Scan for existing files in storage and notify master
+	go dk.scanAndNotifyExistingFiles()
+
 	// Start gRPC server
 	go dk.startGRPCServer()
 
@@ -85,6 +88,58 @@ func (dk *DataKeeper) Stop() {
 	dk.heartbeatTicker.Stop()
 	if dk.masterConn != nil {
 		dk.masterConn.Close()
+	}
+}
+
+// scanAndNotifyExistingFiles scans the storage directory for existing files
+// and notifies the master tracker about them
+func (dk *DataKeeper) scanAndNotifyExistingFiles() {
+	// Wait a bit for the datakeeper to fully start and establish connection
+	time.Sleep(2 * time.Second)
+
+	log.Printf("Scanning storage directory for existing files: %s", dk.storageDir)
+
+	// Read directory contents
+	entries, err := os.ReadDir(dk.storageDir)
+	if err != nil {
+		log.Printf("Warning: Failed to scan storage directory: %v", err)
+		return
+	}
+
+	filesFound := 0
+	for _, entry := range entries {
+		// Skip directories, only process files
+		if entry.IsDir() {
+			continue
+		}
+
+		fileName := entry.Name()
+		filePath := filepath.Join(dk.storageDir, fileName)
+
+		// Notify master about this existing file
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_, err := dk.masterClient.NotifyUploadDone(ctx, &pb.NotifyUploadRequest{
+			FileName: fileName,
+			NodeId:   dk.id,
+			FilePath: filePath,
+		})
+		cancel()
+
+		if err != nil {
+			log.Printf("Warning: Failed to notify master about existing file %s: %v", fileName, err)
+		} else {
+			log.Printf("Registered existing file with master: %s", fileName)
+			filesFound++
+		}
+
+		// Small delay to avoid overwhelming the master
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	if filesFound > 0 {
+		log.Printf("Successfully registered %d existing file(s) with master", filesFound)
+	} else {
+		log.Printf("No existing files found in storage directory")
 	}
 }
 
