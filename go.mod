@@ -8,6 +8,8 @@ require (
 )
 
 require (
+	github.com/caarlos0/env/v6 v6.10.1 // indirect
+	github.com/joho/godotenv v1.5.1 // indirect
 	golang.org/x/net v0.48.0 // indirect
 	golang.org/x/sys v0.39.0 // indirect
 	golang.org/x/text v0.32.0 // indirect
