@@ -288,12 +288,12 @@ func (m *MasterTracker) selectMachineToCopyTo(fileName string, records []FileRec
 
 func (m *MasterTracker) notifyMachineDataTransfer(src *NodeInfo, dst *NodeInfo, fileName, filePath string) {
 
-	srcGrpcAddr := fmt.Sprintf("%s:%d", src.Host, src.GrpcPort)
-	conn, err := grpc.NewClient(srcGrpcAddr,
+	dstGrpcAddr := fmt.Sprintf("%s:%d", dst.Host, dst.GrpcPort)
+	conn, err := grpc.NewClient(dstGrpcAddr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		log.Printf("[MasterTracker] Failed to dial source DataKeeper %s at %s: %v",
-			src.NodeID, srcGrpcAddr, err)
+		log.Printf("[MasterTracker] Failed to dial destination DataKeeper %s at %s: %v",
+			dst.NodeID, dstGrpcAddr, err)
 		return
 	}
 	defer conn.Close()

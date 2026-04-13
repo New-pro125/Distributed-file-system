@@ -307,11 +307,47 @@ func (dk *DataKeeper) handleSourceTransfer(req *pb.TransferRequest) (*pb.Transfe
 	}, nil
 }
 func (dk *DataKeeper) handleDestinationTransfer(req *pb.TransferRequest) (*pb.TransferResponse, error) {
-	log.Printf("Ready to receive file %s from %s:%d", req.FileName, req.Src.Host, req.Src.TcpPort)
-	return &pb.TransferResponse{
-		Success: true,
-		Message: "Ready to receive file",
-	}, nil
+	log.Printf("Pulling file %s from source %s:%d", req.FileName, req.Src.Host, req.Src.TcpPort)
+	srcAddr := fmt.Sprintf("%s:%d", req.Src.Host, req.Src.TcpPort)
+	conn, err := net.DialTimeout("tcp", srcAddr, 10*time.Second)
+	if err != nil {
+		return &pb.TransferResponse{Success: false, Message: fmt.Sprintf("Failed to connect to source: %v", err)}, nil
+	}
+	defer conn.Close()
+
+	if _, err := conn.Write([]byte{0x02}); err != nil {
+		return &pb.TransferResponse{Success: false, Message: fmt.Sprintf("Failed to send operation code: %v", err)}, nil
+	}
+
+	if err := binary.Write(conn, binary.BigEndian, uint32(len(req.FileName))); err != nil {
+		return &pb.TransferResponse{Success: false, Message: fmt.Sprintf("Failed to send filename length: %v", err)}, nil
+	}
+	if _, err := conn.Write([]byte(req.FileName)); err != nil {
+		return &pb.TransferResponse{Success: false, Message: fmt.Sprintf("Failed to send filename: %v", err)}, nil
+	}
+
+	fileName, fileData, err := recvFile(conn)
+	if err != nil {
+		return &pb.TransferResponse{Success: false, Message: fmt.Sprintf("Failed to receive file data: %v", err)}, nil
+	}
+
+	filePath := filepath.Join(dk.storageDir, fileName)
+	if err := os.WriteFile(filePath, fileData, 0644); err != nil {
+		return &pb.TransferResponse{Success: false, Message: fmt.Sprintf("Failed to write to disk: %v", err)}, nil
+	}
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		dk.masterClient.NotifyUploadDone(ctx, &pb.NotifyUploadRequest{
+			FileName: fileName,
+			NodeId:   dk.id,
+			FilePath: filePath,
+		})
+	}()
+
+	log.Printf("Successfully replicated file %s locally", fileName)
+	return &pb.TransferResponse{Success: true, Message: "Replication pulled successfully"}, nil
 }
 func sendFile(conn net.Conn, name string, data []byte) error {
 	nameBytes := []byte(name)
