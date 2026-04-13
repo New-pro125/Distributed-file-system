@@ -9,7 +9,6 @@ import (
 	"net"
 	"os"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	pb "github.com/New-pro125/distributed-file-system/gen/proto"
@@ -23,7 +22,6 @@ type Client struct {
 
 	wg    sync.WaitGroup
 	errCh chan error
-	rrIdx uint32
 }
 
 func New(masterAddr string) (*Client, error) {
@@ -104,11 +102,7 @@ func (c *Client) Download(ctx context.Context, fileName, savePath string) error 
 		return fmt.Errorf("no replicas available for file %s", fileName)
 	}
 
-	nodesCount := len(downloadResp.Nodes)
-	startIdx := int(atomic.AddUint32(&c.rrIdx, 1)) % nodesCount
-	for i := 0; i < nodesCount; i++ {
-		idx := (startIdx + i) % nodesCount
-		node := downloadResp.Nodes[idx]
+	for idx, node := range downloadResp.Nodes {
 		log.Printf("Attempting to download from replica %d: %s:%d", idx+1, node.Host, node.TcpPort)
 
 		fileData, err := c.downloadFromNode(node, fileName)

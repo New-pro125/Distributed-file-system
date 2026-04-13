@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	pb "github.com/New-pro125/distributed-file-system/gen/proto"
@@ -45,6 +46,7 @@ type MasterTracker struct {
 	ReplicationInterval time.Duration
 
 	DesiredReplicas int
+	downloadRR      uint32
 }
 
 func New() *MasterTracker {
@@ -152,10 +154,16 @@ func (m *MasterTracker) RequestDownload(ctx context.Context, req *pb.DownloadReq
 		return nil, fmt.Errorf("no alive replicas for file %q", req.GetFileName())
 	}
 
+	startIdx := int(atomic.AddUint32(&m.downloadRR, 1)) % len(addrs)
+	ordered := make([]*pb.NodeAddress, 0, len(addrs))
+	for i := 0; i < len(addrs); i++ {
+		ordered = append(ordered, addrs[(startIdx+i)%len(addrs)])
+	}
+
 	log.Printf("[MasterTracker] RequestDownload(%s) → %d alive replica(s)",
 		req.GetFileName(), len(addrs))
 
-	return &pb.DownloadResponse{Nodes: addrs}, nil
+	return &pb.DownloadResponse{Nodes: ordered}, nil
 }
 
 func (m *MasterTracker) Heartbeat(ctx context.Context, req *pb.HeartbeatRequest) (*pb.HeartbeatResponse, error) {
