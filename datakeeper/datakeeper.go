@@ -1,6 +1,7 @@
 package datakeeper
 
 import (
+	"bufio"
 	"context"
 	"encoding/binary"
 	"fmt"
@@ -15,6 +16,11 @@ import (
 	pb "github.com/New-pro125/distributed-file-system/gen/proto"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+)
+
+const (
+	// ChunkSize defines the buffer size for streaming operations (32MB)
+	ChunkSize = 32 * 1024 * 1024
 )
 
 type DataKeeper struct {
@@ -191,9 +197,19 @@ func (dk *DataKeeper) handleUpload(conn net.Conn) {
 	}
 	defer file.Close()
 
-	written, err := io.CopyN(file, conn, int64(fileSize))
+	// Use buffered writer for better performance
+	bufWriter := bufio.NewWriterSize(file, ChunkSize)
+	defer bufWriter.Flush()
+
+	written, err := streamWithProgress(bufWriter, conn, int64(fileSize), fileName, "receiving")
 	if err != nil {
 		log.Printf("Failed to stream file %s to disk: %v", fileName, err)
+		return
+	}
+
+	// Ensure all data is flushed to disk
+	if err := bufWriter.Flush(); err != nil {
+		log.Printf("Failed to flush file %s: %v", fileName, err)
 		return
 	}
 
@@ -240,7 +256,10 @@ func (dk *DataKeeper) handleDownload(conn net.Conn) {
 		return
 	}
 	
-	if err := sendFileStream(conn, fileName, file, fileInfo.Size()); err != nil {
+	// Use buffered reader for better performance
+	bufReader := bufio.NewReaderSize(file, ChunkSize)
+	
+	if err := sendFileStream(conn, fileName, bufReader, fileInfo.Size()); err != nil {
 		log.Printf("Failed to send file %s: %v", fileName, err)
 		return
 	}
@@ -330,14 +349,18 @@ func (dk *DataKeeper) handleSourceTransfer(req *pb.TransferRequest) (*pb.Transfe
 			Message: fmt.Sprintf("Failed to send operation code: %v", err),
 		}, nil
 	}
-	if err := sendFileStream(conn, req.FileName, file, fileInfo.Size()); err != nil {
+	
+	// Use buffered reader for better performance during replication
+	bufReader := bufio.NewReaderSize(file, ChunkSize)
+	
+	if err := sendFileStream(conn, req.FileName, bufReader, fileInfo.Size()); err != nil {
 		return &pb.TransferResponse{
 			Success: false,
 			Message: fmt.Sprintf("Failed to send file: %v", err),
 		}, nil
 	}
 
-	log.Printf("Successfully transferred file %s to %s", req.FileName, dstAddr)
+	log.Printf("Successfully transferred file %s (%d bytes) to %s", req.FileName, fileInfo.Size(), dstAddr)
 	return &pb.TransferResponse{
 		Success: true,
 		Message: "File transferred successfully",
@@ -375,9 +398,21 @@ func (dk *DataKeeper) handleDestinationTransfer(req *pb.TransferRequest) (*pb.Tr
 	}
 	defer file.Close()
 
-	if _, err := io.CopyN(file, conn, int64(fileSize)); err != nil {
+	// Use buffered writer for better performance during replication
+	bufWriter := bufio.NewWriterSize(file, ChunkSize)
+	defer bufWriter.Flush()
+
+	written, err := streamWithProgress(bufWriter, conn, int64(fileSize), fileName, "replicating")
+	if err != nil {
 		return &pb.TransferResponse{Success: false, Message: fmt.Sprintf("Failed to stream file data to disk: %v", err)}, nil
 	}
+
+	// Ensure all data is flushed to disk
+	if err := bufWriter.Flush(); err != nil {
+		return &pb.TransferResponse{Success: false, Message: fmt.Sprintf("Failed to flush replicated file: %v", err)}, nil
+	}
+
+	log.Printf("Replication stream complete: %s (%d bytes)", fileName, written)
 
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 1440*time.Second)
@@ -389,7 +424,7 @@ func (dk *DataKeeper) handleDestinationTransfer(req *pb.TransferRequest) (*pb.Tr
 		})
 	}()
 
-	log.Printf("Successfully replicated file %s locally", fileName)
+	log.Printf("Successfully replicated file %s locally (%d bytes)", fileName, written)
 	return &pb.TransferResponse{Success: true, Message: "Replication pulled successfully"}, nil
 }
 // sendFileStream sends a file by streaming it chunk by chunk instead of loading into memory
@@ -405,8 +440,8 @@ func sendFileStream(conn net.Conn, name string, reader io.Reader, size int64) er
 		return fmt.Errorf("failed to write file size: %w", err)
 	}
 	
-	// Stream file data in chunks using io.Copy
-	written, err := io.Copy(conn, reader)
+	// Stream file data in chunks with progress logging
+	written, err := streamWithProgress(conn, reader, size, name, "sending")
 	if err != nil {
 		return fmt.Errorf("failed to stream file data: %w", err)
 	}
@@ -415,6 +450,39 @@ func sendFileStream(conn net.Conn, name string, reader io.Reader, size int64) er
 	}
 
 	return nil
+}
+
+// streamWithProgress copies data in chunks with progress logging
+func streamWithProgress(dst io.Writer, src io.Reader, totalSize int64, fileName, operation string) (int64, error) {
+	buffer := make([]byte, ChunkSize)
+	var totalWritten int64
+	chunkNum := 0
+
+	for {
+		n, readErr := src.Read(buffer)
+		if n > 0 {
+			written, writeErr := dst.Write(buffer[:n])
+			if writeErr != nil {
+				return totalWritten, writeErr
+			}
+			totalWritten += int64(written)
+			chunkNum++
+			
+			// Log progress for each chunk
+			progress := float64(totalWritten) / float64(totalSize) * 100
+			log.Printf("[%s] %s: chunk %d written (%d bytes, %.2f%% complete)", 
+				operation, fileName, chunkNum, written, progress)
+		}
+		
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			return totalWritten, readErr
+		}
+	}
+
+	return totalWritten, nil
 }
 func recvFileHeader(conn net.Conn) (name string, fileSize uint64, err error) {
 	var nameLen uint32

@@ -1,6 +1,7 @@
 package client
 
 import (
+	"bufio"
 	"context"
 	"encoding/binary"
 	"fmt"
@@ -14,6 +15,11 @@ import (
 	pb "github.com/New-pro125/distributed-file-system/gen/proto"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+)
+
+const (
+	// ChunkSize defines the buffer size for streaming operations (32MB)
+	ChunkSize = 10 * 1024 * 1024
 )
 
 type Client struct {
@@ -88,7 +94,10 @@ func (c *Client) Upload(ctx context.Context, filePath string) error {
 		return fmt.Errorf("failed to send operation code: %w", err)
 	}
 
-	if err := sendFileStream(conn, fileName, file, fileInfo.Size()); err != nil {
+	// Use buffered reader for better upload performance
+	bufReader := bufio.NewReaderSize(file, ChunkSize)
+
+	if err := sendFileStream(conn, fileName, bufReader, fileInfo.Size()); err != nil {
 		return fmt.Errorf("failed to send file: %w", err)
 	}
 
@@ -144,49 +153,65 @@ func (c *Client) DownloadParallel(ctx context.Context, fileName, savePath string
 
 	log.Printf("Master returned %d replica(s) for parallel download of %s", len(downloadResp.Nodes), fileName)
 
-	results := make(chan []byte, len(downloadResp.Nodes))
-	errors := make(chan error, len(downloadResp.Nodes))
+	// Use streaming for parallel download too - first successful download wins
+	type result struct {
+		fileSize int64
+		err      error
+	}
+	results := make(chan result, len(downloadResp.Nodes))
 
 	for _, node := range downloadResp.Nodes {
 		c.wg.Add(1)
 		go func(n *pb.NodeAddress) {
 			defer c.wg.Done()
 
-			fileData, err := c.downloadFromNode(n, fileName)
+			// Each goroutine tries to download to a temp file
+			tempPath := savePath + ".tmp." + fmt.Sprintf("%s-%d", n.Host, n.TcpPort)
+			fileSize, err := c.downloadFromNodeToFile(n, fileName, tempPath)
 			if err != nil {
-				errors <- fmt.Errorf("download from %s:%d failed: %w", n.Host, n.TcpPort, err)
+				os.Remove(tempPath) // Clean up temp file on error
+				results <- result{0, fmt.Errorf("download from %s:%d failed: %w", n.Host, n.TcpPort, err)}
 				return
 			}
-			results <- fileData
+			results <- result{fileSize, nil}
 		}(node)
 	}
 
 	c.wg.Wait()
 	close(results)
-	close(errors)
 
-	var fileData []byte
-	for data := range results {
-		fileData = data
-		break
+	// Find first successful download
+	var successSize int64
+	var errMsgs string
+	for res := range results {
+		if res.err == nil && successSize == 0 {
+			successSize = res.fileSize
+		} else if res.err != nil {
+			errMsgs += res.err.Error() + "; "
+		}
 	}
 
-	if fileData == nil {
-
-		var errMsgs string
-		for err := range errors {
-			errMsgs += err.Error() + "; "
-		}
+	if successSize == 0 {
 		return fmt.Errorf("all parallel downloads failed: %s", errMsgs)
 	}
 
-	if err := os.WriteFile(savePath, fileData, 0644); err != nil {
-		return fmt.Errorf("failed to write file to disk: %w", err)
+	// Rename first successful temp file to final destination
+	for _, node := range downloadResp.Nodes {
+		tempPath := savePath + ".tmp." + fmt.Sprintf("%s-%d", node.Host, node.TcpPort)
+		if _, err := os.Stat(tempPath); err == nil {
+			if err := os.Rename(tempPath, savePath); err == nil {
+				log.Printf("Successfully downloaded file %s (%d bytes) in parallel from %s:%d and saved to %s",
+					fileName, successSize, node.Host, node.TcpPort, savePath)
+				// Clean up other temp files
+				for _, n := range downloadResp.Nodes {
+					os.Remove(savePath + ".tmp." + fmt.Sprintf("%s-%d", n.Host, n.TcpPort))
+				}
+				return nil
+			}
+		}
 	}
 
-	log.Printf("Successfully downloaded file %s (%d bytes) in parallel and saved to %s",
-		fileName, len(fileData), savePath)
-	return nil
+	return fmt.Errorf("failed to finalize parallel download")
 }
 
 // downloadFromNodeToFile streams file directly to disk instead of memory
@@ -220,37 +245,6 @@ func (c *Client) downloadFromNodeToFile(node *pb.NodeAddress, fileName, savePath
 	return fileSize, nil
 }
 
-// Legacy function for parallel download (loads into memory for comparison)
-func (c *Client) downloadFromNode(node *pb.NodeAddress, fileName string) ([]byte, error) {
-	dkAddr := fmt.Sprintf("%s:%d", node.Host, node.TcpPort)
-	conn, err := net.DialTimeout("tcp", dkAddr, 30*time.Second)
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect: %w", err)
-	}
-	defer conn.Close()
-	
-	// Set deadline for large file transfers
-	conn.SetDeadline(time.Now().Add(30 * time.Minute))
-
-	if _, err := conn.Write([]byte{0x02}); err != nil {
-		return nil, fmt.Errorf("failed to send operation code: %w", err)
-	}
-
-	if err := binary.Write(conn, binary.BigEndian, uint32(len(fileName))); err != nil {
-		return nil, fmt.Errorf("failed to send filename length: %w", err)
-	}
-	if _, err := conn.Write([]byte(fileName)); err != nil {
-		return nil, fmt.Errorf("failed to send filename: %w", err)
-	}
-
-	_, fileData, err := recvFile(conn)
-	if err != nil {
-		return nil, fmt.Errorf("failed to receive file: %w", err)
-	}
-
-	return fileData, nil
-}
-
 // sendFileStream sends a file by streaming it chunk by chunk instead of loading into memory
 func sendFileStream(conn net.Conn, name string, reader io.Reader, size int64) error {
 	nameBytes := []byte(name)
@@ -267,8 +261,8 @@ func sendFileStream(conn net.Conn, name string, reader io.Reader, size int64) er
 		return fmt.Errorf("failed to write file size: %w", err)
 	}
 
-	// Stream file data in chunks using io.Copy
-	written, err := io.Copy(conn, reader)
+	// Stream file data in chunks with progress logging
+	written, err := streamWithProgress(conn, reader, size, name, "uploading")
 	if err != nil {
 		return fmt.Errorf("failed to stream file data: %w", err)
 	}
@@ -290,6 +284,7 @@ func recvFileToWriter(conn net.Conn, outputPath string) (int64, error) {
 	if _, err := io.ReadFull(conn, nameBuf); err != nil {
 		return 0, fmt.Errorf("failed to read filename: %w", err)
 	}
+	fileName := string(nameBuf)
 
 	var fileSize uint64
 	if err := binary.Read(conn, binary.BigEndian, &fileSize); err != nil {
@@ -303,39 +298,58 @@ func recvFileToWriter(conn net.Conn, outputPath string) (int64, error) {
 	}
 	defer file.Close()
 
-	// Stream data directly to disk
-	written, err := io.CopyN(file, conn, int64(fileSize))
+	// Use buffered writer for better performance
+	bufWriter := bufio.NewWriterSize(file, ChunkSize)
+	defer bufWriter.Flush()
+
+	// Stream data directly to disk with progress logging
+	written, err := streamWithProgress(bufWriter, conn, int64(fileSize), fileName, "downloading")
 	if err != nil {
 		return 0, fmt.Errorf("failed to stream file data to disk: %w", err)
+	}
+
+	// Ensure all data is flushed to disk
+	if err := bufWriter.Flush(); err != nil {
+		return 0, fmt.Errorf("failed to flush file data: %w", err)
 	}
 
 	return written, nil
 }
 
-// Legacy function for parallel download that loads into memory
-func recvFile(conn net.Conn) (name string, data []byte, err error) {
-	var nameLen uint32
-	if err := binary.Read(conn, binary.BigEndian, &nameLen); err != nil {
-		return "", nil, fmt.Errorf("failed to read name length: %w", err)
+// streamWithProgress copies data in chunks with progress logging
+func streamWithProgress(dst io.Writer, src io.Reader, totalSize int64, fileName, operation string) (int64, error) {
+	buffer := make([]byte, ChunkSize)
+	var totalWritten int64
+	chunkNum := 0
+
+	for {
+		n, readErr := src.Read(buffer)
+		if n > 0 {
+			written, writeErr := dst.Write(buffer[:n])
+			if writeErr != nil {
+				return totalWritten, writeErr
+			}
+			totalWritten += int64(written)
+			chunkNum++
+			
+			// Log progress for each chunk
+			progress := float64(totalWritten) / float64(totalSize) * 100
+			log.Printf("[%s] %s: chunk %d written (%d bytes, %.2f%% complete)", 
+				operation, fileName, chunkNum, written, progress)
+		}
+		
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			return totalWritten, readErr
+		}
 	}
 
-	nameBuf := make([]byte, nameLen)
-	if _, err := io.ReadFull(conn, nameBuf); err != nil {
-		return "", nil, fmt.Errorf("failed to read filename: %w", err)
-	}
-
-	var fileSize uint64
-	if err := binary.Read(conn, binary.BigEndian, &fileSize); err != nil {
-		return "", nil, fmt.Errorf("failed to read file size: %w", err)
-	}
-
-	data = make([]byte, fileSize)
-	if _, err := io.ReadFull(conn, data); err != nil {
-		return "", nil, fmt.Errorf("failed to read file data: %w", err)
-	}
-
-	return string(nameBuf), data, nil
+	return totalWritten, nil
 }
+
+
 
 func extractFileName(filePath string) string {
 
