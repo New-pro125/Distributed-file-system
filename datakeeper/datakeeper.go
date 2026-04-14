@@ -95,7 +95,7 @@ func (dk *DataKeeper) scanAndNotifyExistingFiles() {
 
 		fileName := entry.Name()
 		filePath := filepath.Join(dk.storageDir, fileName)
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 1440*time.Second)
 		_, err := dk.masterClient.NotifyUploadDone(ctx, &pb.NotifyUploadRequest{
 			FileName: fileName,
 			NodeId:   dk.id,
@@ -194,7 +194,7 @@ func (dk *DataKeeper) handleUpload(conn net.Conn) {
 	}
 
 	log.Printf("Successfully received and saved file: %s (%d bytes)", fileName, written)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 1440*time.Second)
 	defer cancel()
 
 	_, err = dk.masterClient.NotifyUploadDone(ctx, &pb.NotifyUploadRequest{
@@ -285,7 +285,7 @@ func (dk *DataKeeper) handleSourceTransfer(req *pb.TransferRequest) (*pb.Transfe
 		}, nil
 	}
 	dstAddr := fmt.Sprintf("%s:%d", req.Dst.Host, req.Dst.TcpPort)
-	conn, err := net.DialTimeout("tcp", dstAddr, 10*time.Second)
+	conn, err := net.DialTimeout("tcp", dstAddr, 1440*time.Second)
 	if err != nil {
 		return &pb.TransferResponse{
 			Success: false,
@@ -349,7 +349,7 @@ func (dk *DataKeeper) handleDestinationTransfer(req *pb.TransferRequest) (*pb.Tr
 	}
 
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 1440*time.Second)
 		defer cancel()
 		dk.masterClient.NotifyUploadDone(ctx, &pb.NotifyUploadRequest{
 			FileName: fileName,

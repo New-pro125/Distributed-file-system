@@ -53,7 +53,7 @@ func main() {
 	}
 	defer c.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 1440*time.Second)
 	defer cancel()
 
 	switch *command {
