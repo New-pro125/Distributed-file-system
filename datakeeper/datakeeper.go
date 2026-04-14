@@ -158,6 +158,10 @@ func (dk *DataKeeper) startTCPServer() {
 }
 func (dk *DataKeeper) handleTCPConnection(conn net.Conn) {
 	defer conn.Close()
+	
+	// Set deadline for large file operations (30 minutes)
+	conn.SetDeadline(time.Now().Add(30 * time.Minute))
+	
 	opCode := make([]byte, 1)
 	if _, err := io.ReadFull(conn, opCode); err != nil {
 		log.Printf("Failed to read operation code: %v", err)
@@ -220,17 +224,28 @@ func (dk *DataKeeper) handleDownload(conn net.Conn) {
 	}
 	fileName := string(nameBuf)
 	filePath := filepath.Join(dk.storageDir, fileName)
-	fileData, err := os.ReadFile(filePath)
+	
+	// Open file for streaming instead of loading into memory
+	file, err := os.Open(filePath)
 	if err != nil {
-		log.Printf("Failed to read file %s: %v", fileName, err)
+		log.Printf("Failed to open file %s: %v", fileName, err)
 		return
 	}
-	if err := sendFile(conn, fileName, fileData); err != nil {
+	defer file.Close()
+	
+	// Get file size
+	fileInfo, err := file.Stat()
+	if err != nil {
+		log.Printf("Failed to get file info %s: %v", fileName, err)
+		return
+	}
+	
+	if err := sendFileStream(conn, fileName, file, fileInfo.Size()); err != nil {
 		log.Printf("Failed to send file %s: %v", fileName, err)
 		return
 	}
 
-	log.Printf("Successfully sent file: %s (%d bytes)", fileName, len(fileData))
+	log.Printf("Successfully sent file: %s (%d bytes)", fileName, fileInfo.Size())
 }
 func (dk *DataKeeper) heartbeatLoop() {
 	for {
@@ -238,7 +253,7 @@ func (dk *DataKeeper) heartbeatLoop() {
 		case <-dk.done:
 			return
 		case <-dk.heartbeatTicker.C:
-			resp, err := dk.sendHeartbeat(2 * time.Second)
+			resp, err := dk.sendHeartbeat(10 * time.Second)
 			if err != nil {
 				log.Printf("Heartbeat failed: %v", err)
 			} else if !resp.Accepted {
@@ -277,15 +292,27 @@ func (dk *DataKeeper) NotifyTransfer(ctx context.Context, req *pb.TransferReques
 	}, nil
 }
 func (dk *DataKeeper) handleSourceTransfer(req *pb.TransferRequest) (*pb.TransferResponse, error) {
-	fileData, err := os.ReadFile(req.FilePath)
+	// Open file for streaming instead of loading into memory
+	file, err := os.Open(req.FilePath)
 	if err != nil {
 		return &pb.TransferResponse{
 			Success: false,
-			Message: fmt.Sprintf("Failed to read file: %v", err),
+			Message: fmt.Sprintf("Failed to open file: %v", err),
 		}, nil
 	}
+	defer file.Close()
+	
+	// Get file size
+	fileInfo, err := file.Stat()
+	if err != nil {
+		return &pb.TransferResponse{
+			Success: false,
+			Message: fmt.Sprintf("Failed to get file info: %v", err),
+		}, nil
+	}
+	
 	dstAddr := fmt.Sprintf("%s:%d", req.Dst.Host, req.Dst.TcpPort)
-	conn, err := net.DialTimeout("tcp", dstAddr, 1440*time.Second)
+	conn, err := net.DialTimeout("tcp", dstAddr, 30*time.Second)
 	if err != nil {
 		return &pb.TransferResponse{
 			Success: false,
@@ -293,13 +320,17 @@ func (dk *DataKeeper) handleSourceTransfer(req *pb.TransferRequest) (*pb.Transfe
 		}, nil
 	}
 	defer conn.Close()
+	
+	// Set TCP deadlines for large file transfers
+	conn.SetDeadline(time.Now().Add(30 * time.Minute))
+	
 	if _, err := conn.Write([]byte{0x01}); err != nil {
 		return &pb.TransferResponse{
 			Success: false,
 			Message: fmt.Sprintf("Failed to send operation code: %v", err),
 		}, nil
 	}
-	if err := sendFile(conn, req.FileName, fileData); err != nil {
+	if err := sendFileStream(conn, req.FileName, file, fileInfo.Size()); err != nil {
 		return &pb.TransferResponse{
 			Success: false,
 			Message: fmt.Sprintf("Failed to send file: %v", err),
@@ -361,7 +392,8 @@ func (dk *DataKeeper) handleDestinationTransfer(req *pb.TransferRequest) (*pb.Tr
 	log.Printf("Successfully replicated file %s locally", fileName)
 	return &pb.TransferResponse{Success: true, Message: "Replication pulled successfully"}, nil
 }
-func sendFile(conn net.Conn, name string, data []byte) error {
+// sendFileStream sends a file by streaming it chunk by chunk instead of loading into memory
+func sendFileStream(conn net.Conn, name string, reader io.Reader, size int64) error {
 	nameBytes := []byte(name)
 	if err := binary.Write(conn, binary.BigEndian, uint32(len(nameBytes))); err != nil {
 		return fmt.Errorf("failed to write name length: %w", err)
@@ -369,11 +401,17 @@ func sendFile(conn net.Conn, name string, data []byte) error {
 	if _, err := conn.Write(nameBytes); err != nil {
 		return fmt.Errorf("failed to write filename: %w", err)
 	}
-	if err := binary.Write(conn, binary.BigEndian, uint64(len(data))); err != nil {
+	if err := binary.Write(conn, binary.BigEndian, uint64(size)); err != nil {
 		return fmt.Errorf("failed to write file size: %w", err)
 	}
-	if _, err := conn.Write(data); err != nil {
-		return fmt.Errorf("failed to write file data: %w", err)
+	
+	// Stream file data in chunks using io.Copy
+	written, err := io.Copy(conn, reader)
+	if err != nil {
+		return fmt.Errorf("failed to stream file data: %w", err)
+	}
+	if written != size {
+		return fmt.Errorf("incomplete transfer: wrote %d bytes, expected %d", written, size)
 	}
 
 	return nil

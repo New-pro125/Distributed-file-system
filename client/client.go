@@ -45,10 +45,17 @@ func (c *Client) Close() error {
 }
 
 func (c *Client) Upload(ctx context.Context, filePath string) error {
-
-	fileData, err := os.ReadFile(filePath)
+	// Open file for streaming instead of loading into memory
+	file, err := os.Open(filePath)
 	if err != nil {
-		return fmt.Errorf("failed to read file: %w", err)
+		return fmt.Errorf("failed to open file: %w", err)
+	}
+	defer file.Close()
+	
+	// Get file size
+	fileInfo, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("failed to get file info: %w", err)
 	}
 
 	fileName := extractFileName(filePath)
@@ -68,21 +75,24 @@ func (c *Client) Upload(ctx context.Context, filePath string) error {
 		uploadResp.DataKeeper.Host, uploadResp.DataKeeper.TcpPort)
 
 	dkAddr := fmt.Sprintf("%s:%d", uploadResp.DataKeeper.Host, uploadResp.DataKeeper.TcpPort)
-	conn, err := net.DialTimeout("tcp", dkAddr, 10*time.Second)
+	conn, err := net.DialTimeout("tcp", dkAddr, 30*time.Second)
 	if err != nil {
 		return fmt.Errorf("failed to connect to data keeper: %w", err)
 	}
 	defer conn.Close()
+	
+	// Set deadline for large file transfers
+	conn.SetDeadline(time.Now().Add(30 * time.Minute))
 
 	if _, err := conn.Write([]byte{0x01}); err != nil {
 		return fmt.Errorf("failed to send operation code: %w", err)
 	}
 
-	if err := sendFile(conn, fileName, fileData); err != nil {
+	if err := sendFileStream(conn, fileName, file, fileInfo.Size()); err != nil {
 		return fmt.Errorf("failed to send file: %w", err)
 	}
 
-	log.Printf("Successfully uploaded file %s (%d bytes) to %s", fileName, len(fileData), dkAddr)
+	log.Printf("Successfully uploaded file %s (%d bytes) to %s", fileName, fileInfo.Size(), dkAddr)
 
 	time.Sleep(500 * time.Millisecond)
 
@@ -105,18 +115,14 @@ func (c *Client) Download(ctx context.Context, fileName, savePath string) error 
 	for idx, node := range downloadResp.Nodes {
 		log.Printf("Attempting to download from replica %d: %s:%d", idx+1, node.Host, node.TcpPort)
 
-		fileData, err := c.downloadFromNode(node, fileName)
+		fileSize, err := c.downloadFromNodeToFile(node, fileName, savePath)
 		if err != nil {
 			log.Printf("Failed to download from %s:%d: %v", node.Host, node.TcpPort, err)
 			continue
 		}
 
-		if err := os.WriteFile(savePath, fileData, 0644); err != nil {
-			return fmt.Errorf("failed to write file to disk: %w", err)
-		}
-
 		log.Printf("Successfully downloaded file %s (%d bytes) and saved to %s",
-			fileName, len(fileData), savePath)
+			fileName, fileSize, savePath)
 		return nil
 	}
 
@@ -183,14 +189,48 @@ func (c *Client) DownloadParallel(ctx context.Context, fileName, savePath string
 	return nil
 }
 
-func (c *Client) downloadFromNode(node *pb.NodeAddress, fileName string) ([]byte, error) {
-
+// downloadFromNodeToFile streams file directly to disk instead of memory
+func (c *Client) downloadFromNodeToFile(node *pb.NodeAddress, fileName, savePath string) (int64, error) {
 	dkAddr := fmt.Sprintf("%s:%d", node.Host, node.TcpPort)
-	conn, err := net.DialTimeout("tcp", dkAddr, 10*time.Second)
+	conn, err := net.DialTimeout("tcp", dkAddr, 30*time.Second)
+	if err != nil {
+		return 0, fmt.Errorf("failed to connect: %w", err)
+	}
+	defer conn.Close()
+	
+	// Set deadline for large file transfers
+	conn.SetDeadline(time.Now().Add(30 * time.Minute))
+
+	if _, err := conn.Write([]byte{0x02}); err != nil {
+		return 0, fmt.Errorf("failed to send operation code: %w", err)
+	}
+
+	if err := binary.Write(conn, binary.BigEndian, uint32(len(fileName))); err != nil {
+		return 0, fmt.Errorf("failed to send filename length: %w", err)
+	}
+	if _, err := conn.Write([]byte(fileName)); err != nil {
+		return 0, fmt.Errorf("failed to send filename: %w", err)
+	}
+
+	fileSize, err := recvFileToWriter(conn, savePath)
+	if err != nil {
+		return 0, fmt.Errorf("failed to receive file: %w", err)
+	}
+
+	return fileSize, nil
+}
+
+// Legacy function for parallel download (loads into memory for comparison)
+func (c *Client) downloadFromNode(node *pb.NodeAddress, fileName string) ([]byte, error) {
+	dkAddr := fmt.Sprintf("%s:%d", node.Host, node.TcpPort)
+	conn, err := net.DialTimeout("tcp", dkAddr, 30*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect: %w", err)
 	}
 	defer conn.Close()
+	
+	// Set deadline for large file transfers
+	conn.SetDeadline(time.Now().Add(30 * time.Minute))
 
 	if _, err := conn.Write([]byte{0x02}); err != nil {
 		return nil, fmt.Errorf("failed to send operation code: %w", err)
@@ -211,7 +251,8 @@ func (c *Client) downloadFromNode(node *pb.NodeAddress, fileName string) ([]byte
 	return fileData, nil
 }
 
-func sendFile(conn net.Conn, name string, data []byte) error {
+// sendFileStream sends a file by streaming it chunk by chunk instead of loading into memory
+func sendFileStream(conn net.Conn, name string, reader io.Reader, size int64) error {
 	nameBytes := []byte(name)
 
 	if err := binary.Write(conn, binary.BigEndian, uint32(len(nameBytes))); err != nil {
@@ -222,19 +263,57 @@ func sendFile(conn net.Conn, name string, data []byte) error {
 		return fmt.Errorf("failed to write filename: %w", err)
 	}
 
-	if err := binary.Write(conn, binary.BigEndian, uint64(len(data))); err != nil {
+	if err := binary.Write(conn, binary.BigEndian, uint64(size)); err != nil {
 		return fmt.Errorf("failed to write file size: %w", err)
 	}
 
-	if _, err := conn.Write(data); err != nil {
-		return fmt.Errorf("failed to write file data: %w", err)
+	// Stream file data in chunks using io.Copy
+	written, err := io.Copy(conn, reader)
+	if err != nil {
+		return fmt.Errorf("failed to stream file data: %w", err)
+	}
+	if written != size {
+		return fmt.Errorf("incomplete transfer: wrote %d bytes, expected %d", written, size)
 	}
 
 	return nil
 }
 
-func recvFile(conn net.Conn) (name string, data []byte, err error) {
+// recvFileToWriter streams file directly to disk instead of loading into memory
+func recvFileToWriter(conn net.Conn, outputPath string) (int64, error) {
+	var nameLen uint32
+	if err := binary.Read(conn, binary.BigEndian, &nameLen); err != nil {
+		return 0, fmt.Errorf("failed to read name length: %w", err)
+	}
 
+	nameBuf := make([]byte, nameLen)
+	if _, err := io.ReadFull(conn, nameBuf); err != nil {
+		return 0, fmt.Errorf("failed to read filename: %w", err)
+	}
+
+	var fileSize uint64
+	if err := binary.Read(conn, binary.BigEndian, &fileSize); err != nil {
+		return 0, fmt.Errorf("failed to read file size: %w", err)
+	}
+
+	// Create output file
+	file, err := os.Create(outputPath)
+	if err != nil {
+		return 0, fmt.Errorf("failed to create output file: %w", err)
+	}
+	defer file.Close()
+
+	// Stream data directly to disk
+	written, err := io.CopyN(file, conn, int64(fileSize))
+	if err != nil {
+		return 0, fmt.Errorf("failed to stream file data to disk: %w", err)
+	}
+
+	return written, nil
+}
+
+// Legacy function for parallel download that loads into memory
+func recvFile(conn net.Conn) (name string, data []byte, err error) {
 	var nameLen uint32
 	if err := binary.Read(conn, binary.BigEndian, &nameLen); err != nil {
 		return "", nil, fmt.Errorf("failed to read name length: %w", err)
