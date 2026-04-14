@@ -311,6 +311,15 @@ func (dk *DataKeeper) NotifyTransfer(ctx context.Context, req *pb.TransferReques
 	}, nil
 }
 func (dk *DataKeeper) handleSourceTransfer(req *pb.TransferRequest) (*pb.TransferResponse, error) {
+	// Create unique key for this transfer (file + destination)
+	transferKey := fmt.Sprintf("%s->%s:%d", req.FileName, req.Dst.Host, req.Dst.TcpPort)
+	
+	// Check if already sending this file to this destination
+	if _, exists := dk.activeReplications.LoadOrStore(transferKey, true); exists {
+		return &pb.TransferResponse{Success: false, Message: "Transfer already in progress"}, nil
+	}
+	defer dk.activeReplications.Delete(transferKey)
+	
 	// Open file for streaming instead of loading into memory
 	file, err := os.Open(req.FilePath)
 	if err != nil {
@@ -368,10 +377,15 @@ func (dk *DataKeeper) handleSourceTransfer(req *pb.TransferRequest) (*pb.Transfe
 	}, nil
 }
 func (dk *DataKeeper) handleDestinationTransfer(req *pb.TransferRequest) (*pb.TransferResponse, error) {
+	// Check if file already exists on disk
+	filePath := filepath.Join(dk.storageDir, req.FileName)
+	if _, err := os.Stat(filePath); err == nil {
+		return &pb.TransferResponse{Success: true, Message: "File already exists"}, nil
+	}
+	
 	// Check if this file is already being replicated
 	if _, exists := dk.activeReplications.LoadOrStore(req.FileName, true); exists {
-		log.Printf("Replication already in progress for %s, ignoring duplicate request", req.FileName)
-		return &pb.TransferResponse{Success: true, Message: "Replication already in progress"}, nil
+		return &pb.TransferResponse{Success: false, Message: "Replication already in progress"}, nil
 	}
 	
 	// Ensure cleanup on exit
@@ -401,7 +415,6 @@ func (dk *DataKeeper) handleDestinationTransfer(req *pb.TransferRequest) (*pb.Tr
 		return &pb.TransferResponse{Success: false, Message: fmt.Sprintf("Failed to receive file data: %v", err)}, nil
 	}
 
-	filePath := filepath.Join(dk.storageDir, fileName)
 	file, err := os.Create(filePath)
 	if err != nil {
 		return &pb.TransferResponse{Success: false, Message: fmt.Sprintf("Failed to write to disk: %v", err)}, nil
