@@ -9,7 +9,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"sync"
 	"time"
 
 	pb "github.com/New-pro125/distributed-file-system/gen/proto"
@@ -32,8 +31,6 @@ type DataKeeper struct {
 
 	heartbeatTicker *time.Ticker
 	done            chan struct{}
-
-	mu sync.Mutex
 }
 
 func New(id, host string, grpcPort, tcpPort int32, storageDir, masterAddr string) (*DataKeeper, error) {
@@ -176,18 +173,46 @@ func (dk *DataKeeper) handleTCPConnection(conn net.Conn) {
 	}
 }
 func (dk *DataKeeper) handleUpload(conn net.Conn) {
-	fileName, fileData, err := recvFile(conn)
-	if err != nil {
-		log.Printf("Failed to receive file: %v", err)
-		return
-	}
-	filePath := filepath.Join(dk.storageDir, fileName)
-	if err := os.WriteFile(filePath, fileData, 0644); err != nil {
-		log.Printf("Failed to write file %s: %v", fileName, err)
+	var nameLen uint32
+	if err := binary.Read(conn, binary.BigEndian, &nameLen); err != nil {
+		log.Printf("Failed to read name length: %v", err)
 		return
 	}
 
-	log.Printf("Successfully received and saved file: %s (%d bytes)", fileName, len(fileData))
+	nameBuf := make([]byte, nameLen)
+	if _, err := io.ReadFull(conn, nameBuf); err != nil {
+		log.Printf("Failed to read filename: %v", err)
+		return
+	}
+	fileName := string(nameBuf)
+
+	var fileSize uint64
+	if err := binary.Read(conn, binary.BigEndian, &fileSize); err != nil {
+		log.Printf("Failed to read file size: %v", err)
+		return
+	}
+
+	filePath := filepath.Join(dk.storageDir, fileName)
+	f, err := os.Create(filePath)
+	if err != nil {
+		log.Printf("Failed to create file %s: %v", filePath, err)
+		return
+	}
+
+	written, copyErr := io.CopyN(f, conn, int64(fileSize))
+	closeErr := f.Close()
+	if copyErr != nil {
+		_ = os.Remove(filePath)
+		log.Printf("Failed to receive file data for %s: %v", fileName, copyErr)
+		return
+	}
+	if closeErr != nil {
+		_ = os.Remove(filePath)
+		log.Printf("Failed to finalize file %s: %v", fileName, closeErr)
+		return
+	}
+
+	log.Printf("Successfully received and saved file: %s (%d bytes)", fileName, written)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
