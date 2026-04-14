@@ -21,9 +21,9 @@ import (
 
 const (
 	// ChunkSize defines the buffer size for streaming operations (32MB)
-	ChunkSize = 32 * 1024 * 1024
+	ChunkSize = 16 * 1024 * 1024
 	// LogInterval defines how often to log progress (every 64MB)
-	LogInterval = 64 * 1024 * 1024
+	LogInterval = 16 * 1024 * 1024
 )
 
 type DataKeeper struct {
