@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	pb "github.com/New-pro125/distributed-file-system/gen/proto"
@@ -40,6 +41,9 @@ type DataKeeper struct {
 
 	heartbeatTicker *time.Ticker
 	done            chan struct{}
+	
+	// Track active replications to prevent duplicates
+	activeReplications sync.Map // map[fileName]bool
 }
 
 func New(id, host string, grpcPort, tcpPort int32, storageDir, masterAddr string) (*DataKeeper, error) {
@@ -364,6 +368,15 @@ func (dk *DataKeeper) handleSourceTransfer(req *pb.TransferRequest) (*pb.Transfe
 	}, nil
 }
 func (dk *DataKeeper) handleDestinationTransfer(req *pb.TransferRequest) (*pb.TransferResponse, error) {
+	// Check if this file is already being replicated
+	if _, exists := dk.activeReplications.LoadOrStore(req.FileName, true); exists {
+		log.Printf("Replication already in progress for %s, ignoring duplicate request", req.FileName)
+		return &pb.TransferResponse{Success: true, Message: "Replication already in progress"}, nil
+	}
+	
+	// Ensure cleanup on exit
+	defer dk.activeReplications.Delete(req.FileName)
+	
 	log.Printf("Pulling file %s from source %s:%d", req.FileName, req.Src.Host, req.Src.TcpPort)
 	srcAddr := fmt.Sprintf("%s:%d", req.Src.Host, req.Src.TcpPort)
 	conn, err := net.DialTimeout("tcp", srcAddr, 10*time.Second)
