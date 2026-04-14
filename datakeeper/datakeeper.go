@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"os"
 	"path/filepath"
@@ -173,42 +174,22 @@ func (dk *DataKeeper) handleTCPConnection(conn net.Conn) {
 	}
 }
 func (dk *DataKeeper) handleUpload(conn net.Conn) {
-	var nameLen uint32
-	if err := binary.Read(conn, binary.BigEndian, &nameLen); err != nil {
-		log.Printf("Failed to read name length: %v", err)
-		return
-	}
-
-	nameBuf := make([]byte, nameLen)
-	if _, err := io.ReadFull(conn, nameBuf); err != nil {
-		log.Printf("Failed to read filename: %v", err)
-		return
-	}
-	fileName := string(nameBuf)
-
-	var fileSize uint64
-	if err := binary.Read(conn, binary.BigEndian, &fileSize); err != nil {
-		log.Printf("Failed to read file size: %v", err)
-		return
-	}
-
-	filePath := filepath.Join(dk.storageDir, fileName)
-	f, err := os.Create(filePath)
+	fileName, fileSize, err := recvFileHeader(conn)
 	if err != nil {
-		log.Printf("Failed to create file %s: %v", filePath, err)
+		log.Printf("Failed to receive file: %v", err)
 		return
 	}
+	filePath := filepath.Join(dk.storageDir, fileName)
+	file, err := os.Create(filePath)
+	if err != nil {
+		log.Printf("Failed to write file %s: %v", fileName, err)
+		return
+	}
+	defer file.Close()
 
-	written, copyErr := io.CopyN(f, conn, int64(fileSize))
-	closeErr := f.Close()
-	if copyErr != nil {
-		_ = os.Remove(filePath)
-		log.Printf("Failed to receive file data for %s: %v", fileName, copyErr)
-		return
-	}
-	if closeErr != nil {
-		_ = os.Remove(filePath)
-		log.Printf("Failed to finalize file %s: %v", fileName, closeErr)
+	written, err := io.CopyN(file, conn, int64(fileSize))
+	if err != nil {
+		log.Printf("Failed to stream file %s to disk: %v", fileName, err)
 		return
 	}
 
@@ -351,14 +332,20 @@ func (dk *DataKeeper) handleDestinationTransfer(req *pb.TransferRequest) (*pb.Tr
 		return &pb.TransferResponse{Success: false, Message: fmt.Sprintf("Failed to send filename: %v", err)}, nil
 	}
 
-	fileName, fileData, err := recvFile(conn)
+	fileName, fileSize, err := recvFileHeader(conn)
 	if err != nil {
 		return &pb.TransferResponse{Success: false, Message: fmt.Sprintf("Failed to receive file data: %v", err)}, nil
 	}
 
 	filePath := filepath.Join(dk.storageDir, fileName)
-	if err := os.WriteFile(filePath, fileData, 0644); err != nil {
+	file, err := os.Create(filePath)
+	if err != nil {
 		return &pb.TransferResponse{Success: false, Message: fmt.Sprintf("Failed to write to disk: %v", err)}, nil
+	}
+	defer file.Close()
+
+	if _, err := io.CopyN(file, conn, int64(fileSize)); err != nil {
+		return &pb.TransferResponse{Success: false, Message: fmt.Sprintf("Failed to stream file data to disk: %v", err)}, nil
 	}
 
 	go func() {
@@ -391,23 +378,21 @@ func sendFile(conn net.Conn, name string, data []byte) error {
 
 	return nil
 }
-func recvFile(conn net.Conn) (name string, data []byte, err error) {
+func recvFileHeader(conn net.Conn) (name string, fileSize uint64, err error) {
 	var nameLen uint32
 	if err := binary.Read(conn, binary.BigEndian, &nameLen); err != nil {
-		return "", nil, fmt.Errorf("failed to read name length: %w", err)
+		return "", 0, fmt.Errorf("failed to read name length: %w", err)
 	}
 	nameBuf := make([]byte, nameLen)
 	if _, err := io.ReadFull(conn, nameBuf); err != nil {
-		return "", nil, fmt.Errorf("failed to read filename: %w", err)
+		return "", 0, fmt.Errorf("failed to read filename: %w", err)
 	}
-	var fileSize uint64
 	if err := binary.Read(conn, binary.BigEndian, &fileSize); err != nil {
-		return "", nil, fmt.Errorf("failed to read file size: %w", err)
+		return "", 0, fmt.Errorf("failed to read file size: %w", err)
 	}
-	data = make([]byte, fileSize)
-	if _, err := io.ReadFull(conn, data); err != nil {
-		return "", nil, fmt.Errorf("failed to read file data: %w", err)
+	if fileSize > math.MaxInt64 {
+		return "", 0, fmt.Errorf("file size too large: %d", fileSize)
 	}
 
-	return string(nameBuf), data, nil
+	return string(nameBuf), fileSize, nil
 }
