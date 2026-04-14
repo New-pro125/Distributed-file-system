@@ -19,7 +19,9 @@ import (
 
 const (
 	// ChunkSize defines the buffer size for streaming operations (32MB)
-	ChunkSize = 10 * 1024 * 1024
+	ChunkSize = 32 * 1024 * 1024
+	// LogInterval defines how often to log progress (every 64MB)
+	LogInterval = 64 * 1024 * 1024
 )
 
 type Client struct {
@@ -96,8 +98,9 @@ func (c *Client) Upload(ctx context.Context, filePath string) error {
 
 	// Use buffered reader for better upload performance
 	bufReader := bufio.NewReaderSize(file, ChunkSize)
+	opLabel := fmt.Sprintf("uploading to %s", dkAddr)
 
-	if err := sendFileStream(conn, fileName, bufReader, fileInfo.Size()); err != nil {
+	if err := sendFileStreamWithLabel(conn, fileName, bufReader, fileInfo.Size(), opLabel); err != nil {
 		return fmt.Errorf("failed to send file: %w", err)
 	}
 
@@ -245,8 +248,8 @@ func (c *Client) downloadFromNodeToFile(node *pb.NodeAddress, fileName, savePath
 	return fileSize, nil
 }
 
-// sendFileStream sends a file by streaming it chunk by chunk instead of loading into memory
-func sendFileStream(conn net.Conn, name string, reader io.Reader, size int64) error {
+// sendFileStreamWithLabel sends a file by streaming it chunk by chunk with a custom operation label
+func sendFileStreamWithLabel(conn net.Conn, name string, reader io.Reader, size int64, opLabel string) error {
 	nameBytes := []byte(name)
 
 	if err := binary.Write(conn, binary.BigEndian, uint32(len(nameBytes))); err != nil {
@@ -262,7 +265,7 @@ func sendFileStream(conn net.Conn, name string, reader io.Reader, size int64) er
 	}
 
 	// Stream file data in chunks with progress logging
-	written, err := streamWithProgress(conn, reader, size, name, "uploading")
+	written, err := streamWithProgress(conn, reader, size, name, opLabel)
 	if err != nil {
 		return fmt.Errorf("failed to stream file data: %w", err)
 	}
@@ -298,29 +301,24 @@ func recvFileToWriter(conn net.Conn, outputPath string) (int64, error) {
 	}
 	defer file.Close()
 
-	// Use buffered writer for better performance
-	bufWriter := bufio.NewWriterSize(file, ChunkSize)
-	defer bufWriter.Flush()
+	remoteAddr := conn.RemoteAddr().String()
+	opLabel := fmt.Sprintf("downloading from %s", remoteAddr)
 
 	// Stream data directly to disk with progress logging
-	written, err := streamWithProgress(bufWriter, conn, int64(fileSize), fileName, "downloading")
+	written, err := streamWithProgress(file, conn, int64(fileSize), fileName, opLabel)
 	if err != nil {
 		return 0, fmt.Errorf("failed to stream file data to disk: %w", err)
-	}
-
-	// Ensure all data is flushed to disk
-	if err := bufWriter.Flush(); err != nil {
-		return 0, fmt.Errorf("failed to flush file data: %w", err)
 	}
 
 	return written, nil
 }
 
-// streamWithProgress copies data in chunks with progress logging
+// streamWithProgress copies data in chunks with progress logging at intervals
 func streamWithProgress(dst io.Writer, src io.Reader, totalSize int64, fileName, operation string) (int64, error) {
 	buffer := make([]byte, ChunkSize)
 	var totalWritten int64
-	chunkNum := 0
+	var lastLoggedAt int64
+	logNum := 0
 
 	for {
 		n, readErr := src.Read(buffer)
@@ -330,15 +328,24 @@ func streamWithProgress(dst io.Writer, src io.Reader, totalSize int64, fileName,
 				return totalWritten, writeErr
 			}
 			totalWritten += int64(written)
-			chunkNum++
 			
-			// Log progress for each chunk
-			progress := float64(totalWritten) / float64(totalSize) * 100
-			log.Printf("[%s] %s: chunk %d written (%d bytes, %.2f%% complete)", 
-				operation, fileName, chunkNum, written, progress)
+			// Log progress only at meaningful intervals (every LogInterval bytes)
+			if totalWritten-lastLoggedAt >= LogInterval || readErr == io.EOF {
+				logNum++
+				progress := float64(totalWritten) / float64(totalSize) * 100
+				log.Printf("[%s] %s: progress update %d - %d MB transferred (%.2f%% complete)", 
+					operation, fileName, logNum, totalWritten/(1024*1024), progress)
+				lastLoggedAt = totalWritten
+			}
 		}
 		
 		if readErr == io.EOF {
+			// Log final completion if not already logged
+			if totalWritten > lastLoggedAt {
+				logNum++
+				log.Printf("[%s] %s: completed - %d MB transferred (100.00%% complete)", 
+					operation, fileName, totalWritten/(1024*1024))
+			}
 			break
 		}
 		if readErr != nil {
