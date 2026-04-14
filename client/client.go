@@ -18,9 +18,7 @@ import (
 )
 
 const (
-	// ChunkSize defines the buffer size for streaming operations (32MB)
-	ChunkSize = 16 * 1024 * 1024
-	// LogInterval defines how often to log progress (every 64MB)
+	ChunkSize   = 16 * 1024 * 1024
 	LogInterval = 16 * 1024 * 1024
 )
 
@@ -59,8 +57,7 @@ func (c *Client) Upload(ctx context.Context, filePath string) error {
 		return fmt.Errorf("failed to open file: %w", err)
 	}
 	defer file.Close()
-	
-	// Get file size
+
 	fileInfo, err := file.Stat()
 	if err != nil {
 		return fmt.Errorf("failed to get file info: %w", err)
@@ -88,15 +85,13 @@ func (c *Client) Upload(ctx context.Context, filePath string) error {
 		return fmt.Errorf("failed to connect to data keeper: %w", err)
 	}
 	defer conn.Close()
-	
-	// Set deadline for large file transfers
+
 	conn.SetDeadline(time.Now().Add(30 * time.Minute))
 
 	if _, err := conn.Write([]byte{0x01}); err != nil {
 		return fmt.Errorf("failed to send operation code: %w", err)
 	}
 
-	// Use buffered reader for better upload performance
 	bufReader := bufio.NewReaderSize(file, ChunkSize)
 	opLabel := fmt.Sprintf("uploading to %s", dkAddr)
 
@@ -156,7 +151,6 @@ func (c *Client) DownloadParallel(ctx context.Context, fileName, savePath string
 
 	log.Printf("Master returned %d replica(s) for parallel download of %s", len(downloadResp.Nodes), fileName)
 
-	// Use streaming for parallel download too - first successful download wins
 	type result struct {
 		fileSize int64
 		err      error
@@ -183,7 +177,6 @@ func (c *Client) DownloadParallel(ctx context.Context, fileName, savePath string
 	c.wg.Wait()
 	close(results)
 
-	// Find first successful download
 	var successSize int64
 	var errMsgs string
 	for res := range results {
@@ -198,14 +191,12 @@ func (c *Client) DownloadParallel(ctx context.Context, fileName, savePath string
 		return fmt.Errorf("all parallel downloads failed: %s", errMsgs)
 	}
 
-	// Rename first successful temp file to final destination
 	for _, node := range downloadResp.Nodes {
 		tempPath := savePath + ".tmp." + fmt.Sprintf("%s-%d", node.Host, node.TcpPort)
 		if _, err := os.Stat(tempPath); err == nil {
 			if err := os.Rename(tempPath, savePath); err == nil {
 				log.Printf("Successfully downloaded file %s (%d bytes) in parallel from %s:%d and saved to %s",
 					fileName, successSize, node.Host, node.TcpPort, savePath)
-				// Clean up other temp files
 				for _, n := range downloadResp.Nodes {
 					os.Remove(savePath + ".tmp." + fmt.Sprintf("%s-%d", n.Host, n.TcpPort))
 				}
@@ -217,7 +208,6 @@ func (c *Client) DownloadParallel(ctx context.Context, fileName, savePath string
 	return fmt.Errorf("failed to finalize parallel download")
 }
 
-// downloadFromNodeToFile streams file directly to disk instead of memory
 func (c *Client) downloadFromNodeToFile(node *pb.NodeAddress, fileName, savePath string) (int64, error) {
 	dkAddr := fmt.Sprintf("%s:%d", node.Host, node.TcpPort)
 	conn, err := net.DialTimeout("tcp", dkAddr, 30*time.Second)
@@ -225,8 +215,7 @@ func (c *Client) downloadFromNodeToFile(node *pb.NodeAddress, fileName, savePath
 		return 0, fmt.Errorf("failed to connect: %w", err)
 	}
 	defer conn.Close()
-	
-	// Set deadline for large file transfers
+
 	conn.SetDeadline(time.Now().Add(30 * time.Minute))
 
 	if _, err := conn.Write([]byte{0x02}); err != nil {
@@ -248,7 +237,6 @@ func (c *Client) downloadFromNodeToFile(node *pb.NodeAddress, fileName, savePath
 	return fileSize, nil
 }
 
-// sendFileStreamWithLabel sends a file by streaming it chunk by chunk with a custom operation label
 func sendFileStreamWithLabel(conn net.Conn, name string, reader io.Reader, size int64, opLabel string) error {
 	nameBytes := []byte(name)
 
@@ -264,7 +252,6 @@ func sendFileStreamWithLabel(conn net.Conn, name string, reader io.Reader, size 
 		return fmt.Errorf("failed to write file size: %w", err)
 	}
 
-	// Stream file data in chunks with progress logging
 	written, err := streamWithProgress(conn, reader, size, name, opLabel)
 	if err != nil {
 		return fmt.Errorf("failed to stream file data: %w", err)
@@ -276,7 +263,6 @@ func sendFileStreamWithLabel(conn net.Conn, name string, reader io.Reader, size 
 	return nil
 }
 
-// recvFileToWriter streams file directly to disk instead of loading into memory
 func recvFileToWriter(conn net.Conn, outputPath string) (int64, error) {
 	var nameLen uint32
 	if err := binary.Read(conn, binary.BigEndian, &nameLen); err != nil {
@@ -294,7 +280,6 @@ func recvFileToWriter(conn net.Conn, outputPath string) (int64, error) {
 		return 0, fmt.Errorf("failed to read file size: %w", err)
 	}
 
-	// Create output file
 	file, err := os.Create(outputPath)
 	if err != nil {
 		return 0, fmt.Errorf("failed to create output file: %w", err)
@@ -304,7 +289,6 @@ func recvFileToWriter(conn net.Conn, outputPath string) (int64, error) {
 	remoteAddr := conn.RemoteAddr().String()
 	opLabel := fmt.Sprintf("downloading from %s", remoteAddr)
 
-	// Stream data directly to disk with progress logging
 	written, err := streamWithProgress(file, conn, int64(fileSize), fileName, opLabel)
 	if err != nil {
 		return 0, fmt.Errorf("failed to stream file data to disk: %w", err)
@@ -313,7 +297,6 @@ func recvFileToWriter(conn net.Conn, outputPath string) (int64, error) {
 	return written, nil
 }
 
-// streamWithProgress copies data in chunks with progress logging at intervals
 func streamWithProgress(dst io.Writer, src io.Reader, totalSize int64, fileName, operation string) (int64, error) {
 	buffer := make([]byte, ChunkSize)
 	var totalWritten int64
@@ -328,22 +311,20 @@ func streamWithProgress(dst io.Writer, src io.Reader, totalSize int64, fileName,
 				return totalWritten, writeErr
 			}
 			totalWritten += int64(written)
-			
-			// Log progress only at meaningful intervals (every LogInterval bytes)
+
 			if totalWritten-lastLoggedAt >= LogInterval || readErr == io.EOF {
 				logNum++
 				progress := float64(totalWritten) / float64(totalSize) * 100
-				log.Printf("[%s] %s: progress update %d - %d MB transferred (%.2f%% complete)", 
+				log.Printf("[%s] %s: progress update %d - %d MB transferred (%.2f%% complete)",
 					operation, fileName, logNum, totalWritten/(1024*1024), progress)
 				lastLoggedAt = totalWritten
 			}
 		}
-		
+
 		if readErr == io.EOF {
-			// Log final completion if not already logged
 			if totalWritten > lastLoggedAt {
 				logNum++
-				log.Printf("[%s] %s: completed - %d MB transferred (100.00%% complete)", 
+				log.Printf("[%s] %s: completed - %d MB transferred (100.00%% complete)",
 					operation, fileName, totalWritten/(1024*1024))
 			}
 			break
@@ -355,8 +336,6 @@ func streamWithProgress(dst io.Writer, src io.Reader, totalSize int64, fileName,
 
 	return totalWritten, nil
 }
-
-
 
 func extractFileName(filePath string) string {
 

@@ -20,9 +20,7 @@ import (
 )
 
 const (
-	// ChunkSize defines the buffer size for streaming operations (32MB)
-	ChunkSize = 16 * 1024 * 1024
-	// LogInterval defines how often to log progress (every 64MB)
+	ChunkSize   = 16 * 1024 * 1024
 	LogInterval = 16 * 1024 * 1024
 )
 
@@ -41,9 +39,8 @@ type DataKeeper struct {
 
 	heartbeatTicker *time.Ticker
 	done            chan struct{}
-	
-	// Track active replications to prevent duplicates
-	activeReplications sync.Map // map[fileName]bool
+
+	activeReplications sync.Map
 }
 
 func New(id, host string, grpcPort, tcpPort int32, storageDir, masterAddr string) (*DataKeeper, error) {
@@ -170,10 +167,9 @@ func (dk *DataKeeper) startTCPServer() {
 }
 func (dk *DataKeeper) handleTCPConnection(conn net.Conn) {
 	defer conn.Close()
-	
-	// Set deadline for large file operations (30 minutes)
+
 	conn.SetDeadline(time.Now().Add(30 * time.Minute))
-	
+
 	opCode := make([]byte, 1)
 	if _, err := io.ReadFull(conn, opCode); err != nil {
 		log.Printf("Failed to read operation code: %v", err)
@@ -238,27 +234,24 @@ func (dk *DataKeeper) handleDownload(conn net.Conn) {
 	}
 	fileName := string(nameBuf)
 	filePath := filepath.Join(dk.storageDir, fileName)
-	
-	// Open file for streaming instead of loading into memory
+
 	file, err := os.Open(filePath)
 	if err != nil {
 		log.Printf("Failed to open file %s: %v", fileName, err)
 		return
 	}
 	defer file.Close()
-	
-	// Get file size
+
 	fileInfo, err := file.Stat()
 	if err != nil {
 		log.Printf("Failed to get file info %s: %v", fileName, err)
 		return
 	}
-	
-	// Use buffered reader for better performance
+
 	bufReader := bufio.NewReaderSize(file, ChunkSize)
 	clientAddr := conn.RemoteAddr().String()
 	opLabel := fmt.Sprintf("sending to %s", clientAddr)
-	
+
 	if err := sendFileStreamWithLabel(conn, fileName, bufReader, fileInfo.Size(), opLabel); err != nil {
 		log.Printf("Failed to send file %s: %v", fileName, err)
 		return
@@ -311,16 +304,13 @@ func (dk *DataKeeper) NotifyTransfer(ctx context.Context, req *pb.TransferReques
 	}, nil
 }
 func (dk *DataKeeper) handleSourceTransfer(req *pb.TransferRequest) (*pb.TransferResponse, error) {
-	// Create unique key for this transfer (file + destination)
 	transferKey := fmt.Sprintf("%s->%s:%d", req.FileName, req.Dst.Host, req.Dst.TcpPort)
-	
-	// Check if already sending this file to this destination
+
 	if _, exists := dk.activeReplications.LoadOrStore(transferKey, true); exists {
 		return &pb.TransferResponse{Success: false, Message: "Transfer already in progress"}, nil
 	}
 	defer dk.activeReplications.Delete(transferKey)
-	
-	// Open file for streaming instead of loading into memory
+
 	file, err := os.Open(req.FilePath)
 	if err != nil {
 		return &pb.TransferResponse{
@@ -329,8 +319,7 @@ func (dk *DataKeeper) handleSourceTransfer(req *pb.TransferRequest) (*pb.Transfe
 		}, nil
 	}
 	defer file.Close()
-	
-	// Get file size
+
 	fileInfo, err := file.Stat()
 	if err != nil {
 		return &pb.TransferResponse{
@@ -338,7 +327,7 @@ func (dk *DataKeeper) handleSourceTransfer(req *pb.TransferRequest) (*pb.Transfe
 			Message: fmt.Sprintf("Failed to get file info: %v", err),
 		}, nil
 	}
-	
+
 	dstAddr := fmt.Sprintf("%s:%d", req.Dst.Host, req.Dst.TcpPort)
 	conn, err := net.DialTimeout("tcp", dstAddr, 30*time.Second)
 	if err != nil {
@@ -348,21 +337,19 @@ func (dk *DataKeeper) handleSourceTransfer(req *pb.TransferRequest) (*pb.Transfe
 		}, nil
 	}
 	defer conn.Close()
-	
-	// Set TCP deadlines for large file transfers
+
 	conn.SetDeadline(time.Now().Add(30 * time.Minute))
-	
+
 	if _, err := conn.Write([]byte{0x01}); err != nil {
 		return &pb.TransferResponse{
 			Success: false,
 			Message: fmt.Sprintf("Failed to send operation code: %v", err),
 		}, nil
 	}
-	
-	// Use buffered reader for better performance during replication
+
 	bufReader := bufio.NewReaderSize(file, ChunkSize)
 	opLabel := fmt.Sprintf("sending to %s:%d", req.Dst.Host, req.Dst.TcpPort)
-	
+
 	if err := sendFileStreamWithLabel(conn, req.FileName, bufReader, fileInfo.Size(), opLabel); err != nil {
 		return &pb.TransferResponse{
 			Success: false,
@@ -377,20 +364,17 @@ func (dk *DataKeeper) handleSourceTransfer(req *pb.TransferRequest) (*pb.Transfe
 	}, nil
 }
 func (dk *DataKeeper) handleDestinationTransfer(req *pb.TransferRequest) (*pb.TransferResponse, error) {
-	// Check if file already exists on disk
 	filePath := filepath.Join(dk.storageDir, req.FileName)
 	if _, err := os.Stat(filePath); err == nil {
 		return &pb.TransferResponse{Success: true, Message: "File already exists"}, nil
 	}
-	
-	// Check if this file is already being replicated
+
 	if _, exists := dk.activeReplications.LoadOrStore(req.FileName, true); exists {
 		return &pb.TransferResponse{Success: false, Message: "Replication already in progress"}, nil
 	}
-	
-	// Ensure cleanup on exit
+
 	defer dk.activeReplications.Delete(req.FileName)
-	
+
 	log.Printf("Pulling file %s from source %s:%d", req.FileName, req.Src.Host, req.Src.TcpPort)
 	srcAddr := fmt.Sprintf("%s:%d", req.Src.Host, req.Src.TcpPort)
 	conn, err := net.DialTimeout("tcp", srcAddr, 10*time.Second)
@@ -443,7 +427,7 @@ func (dk *DataKeeper) handleDestinationTransfer(req *pb.TransferRequest) (*pb.Tr
 	log.Printf("Successfully replicated file %s locally (%d bytes)", fileName, written)
 	return &pb.TransferResponse{Success: true, Message: "Replication pulled successfully"}, nil
 }
-// sendFileStreamWithLabel sends a file by streaming it chunk by chunk with a custom operation label
+
 func sendFileStreamWithLabel(conn net.Conn, name string, reader io.Reader, size int64, opLabel string) error {
 	nameBytes := []byte(name)
 	if err := binary.Write(conn, binary.BigEndian, uint32(len(nameBytes))); err != nil {
@@ -455,8 +439,7 @@ func sendFileStreamWithLabel(conn net.Conn, name string, reader io.Reader, size 
 	if err := binary.Write(conn, binary.BigEndian, uint64(size)); err != nil {
 		return fmt.Errorf("failed to write file size: %w", err)
 	}
-	
-	// Stream file data in chunks with progress logging
+
 	written, err := streamWithProgress(conn, reader, size, name, opLabel)
 	if err != nil {
 		return fmt.Errorf("failed to stream file data: %w", err)
@@ -468,7 +451,6 @@ func sendFileStreamWithLabel(conn net.Conn, name string, reader io.Reader, size 
 	return nil
 }
 
-// streamWithProgress copies data in chunks with progress logging at intervals
 func streamWithProgress(dst io.Writer, src io.Reader, totalSize int64, fileName, operation string) (int64, error) {
 	buffer := make([]byte, ChunkSize)
 	var totalWritten int64
@@ -483,22 +465,20 @@ func streamWithProgress(dst io.Writer, src io.Reader, totalSize int64, fileName,
 				return totalWritten, writeErr
 			}
 			totalWritten += int64(written)
-			
-			// Log progress only at meaningful intervals (every LogInterval bytes)
+
 			if totalWritten-lastLoggedAt >= LogInterval || readErr == io.EOF {
 				logNum++
 				progress := float64(totalWritten) / float64(totalSize) * 100
-				log.Printf("[%s] %s: progress update %d - %d MB transferred (%.2f%% complete)", 
+				log.Printf("[%s] %s: progress update %d - %d MB transferred (%.2f%% complete)",
 					operation, fileName, logNum, totalWritten/(1024*1024), progress)
 				lastLoggedAt = totalWritten
 			}
 		}
-		
+
 		if readErr == io.EOF {
-			// Log final completion if not already logged
 			if totalWritten > lastLoggedAt {
 				logNum++
-				log.Printf("[%s] %s: completed - %d MB transferred (100.00%% complete)", 
+				log.Printf("[%s] %s: completed - %d MB transferred (100.00%% complete)",
 					operation, fileName, totalWritten/(1024*1024))
 			}
 			break
